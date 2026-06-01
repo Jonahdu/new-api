@@ -19,6 +19,38 @@ func isDeepSeekModel(modelID string) bool {
 	return strings.HasPrefix(modelID, "deepseek-")
 }
 
+// isMiMoModel returns true for MiMo models that require thinking mode handling.
+func isMiMoModel(modelID string) bool {
+	return strings.HasPrefix(modelID, "mimo-")
+}
+
+// isReasoningContentVendor returns true for vendors that need reasoning_content
+// preserved on assistant messages for multi-turn tool-call round-trips.
+func isReasoningContentVendor(modelID string) bool {
+	return isDeepSeekModel(modelID) || isMiMoModel(modelID) ||
+		strings.Contains(modelID, "kimi") || strings.Contains(modelID, "moonshot")
+}
+
+// stripLeadingAnthropicBillingHeader removes the leading x-anthropic-billing-header
+// metadata that Claude Code injects into system prompts. Stripping it prevents
+// prefix cache invalidation on OpenAI-compatible backends. Only the leading
+// occurrence is removed to avoid deleting user-authored text later in the prompt.
+func stripLeadingAnthropicBillingHeader(s string) string {
+	const prefix = "<!-- x-anthropic-billing-header:"
+	idx := strings.Index(s, prefix)
+	if idx != 0 {
+		return s
+	}
+	end := strings.Index(s[idx:], "-->")
+	if end == -1 {
+		return s
+	}
+	rest := s[idx+end+3:]
+	// Strip leading whitespace/newline after the header
+	rest = strings.TrimLeft(rest, "\n\r ")
+	return rest
+}
+
 // hasThinkingBlocksInHistory checks if any assistant message in the conversation
 // contains thinking content blocks (for history continuity detection).
 func hasThinkingBlocksInHistory(messages []dto.ClaudeMessage) bool {
@@ -46,6 +78,36 @@ func hasThinkingBlocksInHistory(messages []dto.ClaudeMessage) bool {
 	return false
 }
 
+// resolveReasoningEffort maps Anthropic thinking config to OpenAI reasoning_effort.
+// Priority: output_config.effort > thinking.type + budget_tokens mapping.
+// Supports "xhigh" for adaptive thinking (used by Claude Opus 4.6+ via new-api).
+func resolveReasoningEffort(thinking *dto.Thinking, outputConfig json.RawMessage) string {
+	if thinking == nil {
+		return ""
+	}
+	// 1. Check output_config.effort first (cc-switch pattern)
+	if len(outputConfig) > 0 {
+		var cfg dto.OutputConfigForEffort
+		if err := json.Unmarshal(outputConfig, &cfg); err == nil && cfg.Effort != "" {
+			switch cfg.Effort {
+			case "low", "medium", "high":
+				return cfg.Effort
+			case "max":
+				return "xhigh"
+			}
+		}
+	}
+	// 2. Fallback to thinking.type + budget_tokens
+	if thinking.Type == "adaptive" {
+		return "xhigh"
+	}
+	budget := thinking.GetBudgetTokens()
+	if budget > 0 {
+		return budgetTokensToEffort(budget)
+	}
+	return ""
+}
+
 // budgetTokensToEffort maps Anthropic budget_tokens to OpenAI reasoning_effort.
 func budgetTokensToEffort(budget int) string {
 	switch {
@@ -68,6 +130,86 @@ func hasAssistantMessages(messages []dto.ClaudeMessage) bool {
 		}
 	}
 	return false
+}
+
+// cleanToolSchema recursively removes unsupported fields from tool input schemas.
+// Some OpenAI-compatible providers reject schemas with "format": "uri" etc.
+func cleanToolSchema(schema map[string]interface{}) {
+	if schema == nil {
+		return
+	}
+	delete(schema, "format") // remove unsupported "format": "uri"
+	if properties, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, prop := range properties {
+			if propMap, ok := prop.(map[string]interface{}); ok {
+				cleanToolSchema(propMap)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		cleanToolSchema(items)
+	}
+}
+
+// normalizeThinkingHistory ensures that assistant messages with tool_use have a
+// preceding thinking block (required by DeepSeek/MiMo vendors). Converts
+// redacted_thinking to plain thinking with placeholder and strips signatures.
+func normalizeThinkingHistory(messages []dto.ClaudeMessage) []dto.ClaudeMessage {
+	result := make([]dto.ClaudeMessage, len(messages))
+	for i, msg := range messages {
+		result[i] = msg
+		if msg.Role != "assistant" || msg.IsStringContent() {
+			continue
+		}
+		blocks, err := msg.ParseContent()
+		if err != nil || len(blocks) == 0 {
+			continue
+		}
+		// Check if this message has tool_use
+		hasToolUse := false
+		for _, b := range blocks {
+			if b.Type == "tool_use" {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse {
+			continue
+		}
+		// Check if there's already a thinking block at the start
+		if len(blocks) > 0 && blocks[0].Type == "thinking" {
+			// Strip signature from thinking blocks and convert redacted_thinking
+			for j := range blocks {
+				if blocks[j].Type == "thinking" || blocks[j].Type == "redacted_thinking" {
+					blocks[j].Signature = ""
+					if blocks[j].Type == "redacted_thinking" {
+						blocks[j].Type = "thinking"
+						placeholder := "tool call"
+						blocks[j].Thinking = &placeholder
+					}
+				}
+			}
+			continue
+		}
+		// No thinking block at the start — insert placeholder and strip signatures
+		normalized := make([]dto.ClaudeMediaMessage, 0, len(blocks)+1)
+		normalized = append(normalized, dto.ClaudeMediaMessage{
+			Type:     "thinking",
+			Thinking: common.GetPointer[string]("tool call"),
+		})
+		for _, b := range blocks {
+			b.Signature = ""
+			if b.Type == "redacted_thinking" {
+				b.Type = "thinking"
+				placeholder := "tool call"
+				b.Thinking = &placeholder
+			}
+			normalized = append(normalized, b)
+		}
+		msg.Content = normalized
+		result[i] = msg
+	}
+	return result
 }
 
 func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {
@@ -114,12 +256,11 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 			openAIRequest.Reasoning = reasoningJSON
 		}
 	} else {
-		// 非 OpenRouter 渠道：根据 budget_tokens 映射 reasoning_effort（4档）
+		// 非 OpenRouter 渠道：使用 resolveReasoningEffort 映射（支持 output_config + adaptive → xhigh）
 		if claudeRequest.Thinking != nil && (claudeRequest.Thinking.Type == "enabled" || claudeRequest.Thinking.Type == "adaptive") {
-			budget := claudeRequest.Thinking.GetBudgetTokens()
-			openAIRequest.ReasoningEffort = budgetTokensToEffort(budget)
+			openAIRequest.ReasoningEffort = resolveReasoningEffort(claudeRequest.Thinking, claudeRequest.OutputConfig)
 		}
-		// DeepSeek thinking 模式安全防护
+		// DeepSeek/MiMo thinking 模式安全防护
 		if isDeepSeekModel(info.OriginModelName) {
 			if hasAssistantMessages(claudeRequest.Messages) && !hasThinkingBlocksInHistory(claudeRequest.Messages) {
 				openAIRequest.ReasoningEffort = ""
@@ -144,6 +285,8 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 	tools, _ := common.Any2Type[[]dto.Tool](claudeRequest.Tools)
 	openAITools := make([]dto.ToolCallRequest, 0)
 	for _, claudeTool := range tools {
+		// Clean schema to remove unsupported fields like "format": "uri"
+		cleanToolSchema(claudeTool.InputSchema)
 		openAITool := dto.ToolCallRequest{
 			Type: "function",
 			Function: dto.FunctionRequest{
@@ -180,13 +323,20 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 	// Convert messages
 	openAIMessages := make([]dto.Message, 0)
 
+	// Normalize thinking history for DeepSeek/MiMo vendors
+	normalizedMessages := claudeRequest.Messages
+	if isReasoningContentVendor(info.OriginModelName) {
+		normalizedMessages = normalizeThinkingHistory(claudeRequest.Messages)
+	}
+
 	// Add system message if present
 	if claudeRequest.System != nil {
 		if claudeRequest.IsStringSystem() && claudeRequest.GetStringSystem() != "" {
 			openAIMessage := dto.Message{
 				Role: "system",
 			}
-			openAIMessage.SetStringContent(claudeRequest.GetStringSystem())
+			// Strip leading billing header to preserve prefix cache on OpenAI backends
+			openAIMessage.SetStringContent(stripLeadingAnthropicBillingHeader(claudeRequest.GetStringSystem()))
 			openAIMessages = append(openAIMessages, openAIMessage)
 		} else {
 			systems := claudeRequest.ParseSystem()
@@ -213,13 +363,15 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 							systemStr += *system.Text
 						}
 					}
+					// Strip leading billing header to preserve prefix cache
+					systemStr = stripLeadingAnthropicBillingHeader(systemStr)
 					openAIMessage.SetStringContent(systemStr)
 				}
 				openAIMessages = append(openAIMessages, openAIMessage)
 			}
 		}
 	}
-	for _, claudeMessage := range claudeRequest.Messages {
+	for _, claudeMessage := range normalizedMessages {
 		openAIMessage := dto.Message{
 			Role: claudeMessage.Role,
 		}
@@ -251,8 +403,9 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 							Type: "text",
 							Text: *mediaMsg.Thinking,
 						})
-						// 保留 thinking 内容为 reasoning_content（DeepSeek 等模型需要）
-						if openAIMessage.Role == "assistant" && openAIMessage.ReasoningContent == "" {
+						// 保留 reasoning_content 仅对需要的厂商（DeepSeek/MiMo/Kimi 等）
+						if openAIMessage.Role == "assistant" && openAIMessage.ReasoningContent == "" &&
+							isReasoningContentVendor(info.OriginModelName) {
 							openAIMessage.ReasoningContent = *mediaMsg.Thinking
 						}
 					}
@@ -292,7 +445,6 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 						Name:       &toolName,
 						ToolCallId: mediaMsg.ToolUseId,
 					}
-					//oaiToolMessage.SetStringContent(*mediaMsg.GetMediaContent().Text)
 					if mediaMsg.IsStringContent() {
 						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
 					} else {
@@ -300,16 +452,21 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 						encodeJson, _ := common.Marshal(mediaContents)
 						oaiToolMessage.SetStringContent(string(encodeJson))
 					}
+					// Handle is_error: prefix error content for upstream visibility
+					if mediaMsg.IsError {
+						errContent := oaiToolMessage.StringContent()
+						oaiToolMessage.SetStringContent("ERROR: " + errContent)
+					}
 					openAIMessages = append(openAIMessages, oaiToolMessage)
 				}
 			}
 
-				// DeepSeek reasoning_content 占位符：thinking 模式下每条 assistant 消息都需要
-				if openAIMessage.Role == "assistant" && openAIMessage.ReasoningContent == "" {
-			if isDeepSeekModel(info.OriginModelName) && hasThinkingBlocksInHistory(claudeRequest.Messages) {
-				openAIMessage.ReasoningContent = " "
-			}
+			// reasoning_content 占位符：thinking 模式下需要的厂商（DeepSeek/MiMo）每条 assistant 消息都需要
+			if openAIMessage.Role == "assistant" && openAIMessage.ReasoningContent == "" {
+				if isReasoningContentVendor(info.OriginModelName) && hasThinkingBlocksInHistory(normalizedMessages) {
+					openAIMessage.ReasoningContent = " "
 				}
+			}
 			if len(toolCalls) > 0 {
 				openAIMessage.SetToolCalls(toolCalls)
 			}
@@ -501,6 +658,30 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 					},
 				})
 				info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
+				// Also emit text if present in same chunk
+				if content != "" {
+					claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
+					info.ClaudeConvertInfo.Index++
+					idx3 := info.ClaudeConvertInfo.Index
+					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+						Index: &idx3,
+						Type:  "content_block_start",
+						ContentBlock: &dto.ClaudeMediaMessage{
+							Type: "text",
+							Text: common.GetPointer[string](""),
+						},
+					})
+					idx4 := idx3
+					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+						Index: &idx4,
+						Type:  "content_block_delta",
+						Delta: &dto.ClaudeMediaMessage{
+							Type: "text_delta",
+							Text: common.GetPointer[string](content),
+						},
+					})
+					info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
+				}
 			} else if content != "" {
 				if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
 					stopOpenBlocksAndAdvance()
@@ -648,6 +829,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			reasoning := chosenChoice.Delta.GetReasoningContent()
 			textContent := chosenChoice.Delta.GetContentString()
 			if reasoning != "" || textContent != "" {
+				// Handle reasoning block (may coexist with text in same chunk)
 				if reasoning != "" {
 					if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
 						stopOpenBlocksAndAdvance()
@@ -666,9 +848,21 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 						Type:     "thinking_delta",
 						Thinking: &reasoning,
 					}
-				} else {
+				}
+				// Handle text block (may coexist with reasoning in same chunk)
+				if textContent != "" {
+					if reasoning != "" {
+						// Same chunk has both reasoning and text — stop reasoning block first
+						claudeResponses = append(claudeResponses, &claudeResponse)
+						claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
+						info.ClaudeConvertInfo.Index++
+						claudeResponse = dto.ClaudeResponse{}
+					}
 					if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
-						stopOpenBlocksAndAdvance()
+						if reasoning == "" {
+							// No reasoning preceded, check if we need to stop open blocks
+							stopOpenBlocksAndAdvance()
+						}
 						idx := info.ClaudeConvertInfo.Index
 						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 							Index: &idx,
@@ -684,6 +878,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 						Type: "text_delta",
 						Text: common.GetPointer[string](textContent),
 					}
+					claudeResponse.Index = common.GetPointer[int](info.ClaudeConvertInfo.Index)
 				}
 			} else {
 				isEmpty = true
