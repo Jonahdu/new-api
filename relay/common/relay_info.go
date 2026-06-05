@@ -43,6 +43,17 @@ type ClaudeConvertInfo struct {
 
 	ToolCallBaseIndex      int
 	ToolCallMaxIndexOffset int
+
+	// Stream chunk counters for debugging reasoning_content vs content distribution
+	ReasoningChunks int
+	ContentChunks   int
+	ToolCallChunks  int
+
+	// ReasoningTextBuilder accumulates reasoning_content text so that when
+	// the stream ends with ContentChunks == 0 (upstream never sent content),
+	// the accumulated reasoning can be flushed as text_delta instead of being
+	// trapped in a folded thinking block.
+	ReasoningTextBuilder strings.Builder
 }
 
 type RerankerInfo struct {

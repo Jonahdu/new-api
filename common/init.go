@@ -63,6 +63,17 @@ func InitEnv() {
 	}
 	if os.Getenv("SQLITE_PATH") != "" {
 		SQLitePath = os.Getenv("SQLITE_PATH")
+	} else {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dbDir := filepath.Join(home, "Library/Application Support/new-api")
+			if err := os.MkdirAll(dbDir, 0755); err != nil {
+				log.Fatal("cannot create database directory: " + dbDir + ": " + err.Error())
+			}
+			SQLitePath = filepath.Join(dbDir, "one-api.db") + "?_busy_timeout=30000"
+		} else {
+			SysLog("cannot get user home dir: " + err.Error() + ", fallback to relative path")
+		}
 	}
 	if *LogDir != "" {
 		var err error

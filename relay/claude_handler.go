@@ -41,6 +41,12 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
 
+	// count_tokens: set max_tokens=1 so upstream generates minimally
+	// (just enough to get usage.prompt_tokens back and warm cache).
+	if c.GetBool("count_tokens") {
+		request.MaxTokens = common.GetPointer[uint](1)
+	}
+
 	adaptor := GetAdaptor(info.ApiType)
 	if adaptor == nil {
 		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())

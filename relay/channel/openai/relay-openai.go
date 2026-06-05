@@ -186,6 +186,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
+	if common.DebugEnabled && info.ClaudeConvertInfo != nil {
+		common.SysLog(fmt.Sprintf("stream chunk summary: model=%s reasoning=%d content=%d tool_calls=%d",
+			model, info.ClaudeConvertInfo.ReasoningChunks, info.ClaudeConvertInfo.ContentChunks, info.ClaudeConvertInfo.ToolCallChunks))
+	}
+
 	return usage, nil
 }
 
@@ -287,6 +292,14 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
 		responseBody = geminiRespStr
+	}
+
+	// count_tokens: upstream ran (cache warmed), but return only the token count.
+	if c.GetBool("count_tokens") {
+		respObj := gin.H{"input_tokens": simpleResponse.Usage.PromptTokens}
+		if b, err := common.Marshal(respObj); err == nil {
+			responseBody = b
+		}
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)

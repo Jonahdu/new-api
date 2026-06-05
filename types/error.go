@@ -215,9 +215,17 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 	switch e.errorType {
 	case ErrorTypeOpenAIError:
 		if openAIError, ok := e.RelayError.(OpenAIError); ok {
+			claudeType := fmt.Sprintf("%v", openAIError.Code)
+			// Map OpenAI error codes to Anthropic-compatible types
+			switch claudeType {
+			case "context_length_exceeded":
+				claudeType = "invalid_request_error"
+			case "rate_limit_exceeded":
+				claudeType = "rate_limit_error"
+			}
 			result = ClaudeError{
 				Message: e.Error(),
-				Type:    fmt.Sprintf("%v", openAIError.Code),
+				Type:    claudeType,
 			}
 		}
 	case ErrorTypeClaudeError:

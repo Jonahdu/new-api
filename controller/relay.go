@@ -233,6 +233,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
@@ -247,7 +248,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 }
 
+
 var upgrader = websocket.Upgrader{
+
 	Subprotocols: []string{"realtime"}, // WS 握手支持的协议，如果有使用 Sec-WebSocket-Protocol，则必须在此声明对应的 Protocol TODO add other protocol
 	CheckOrigin: func(r *http.Request) bool {
 		return true // 允许跨域
@@ -561,6 +564,7 @@ func RelayTask(c *gin.Context) {
 		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
