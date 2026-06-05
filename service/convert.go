@@ -558,6 +558,10 @@ func flushReasoningAsText(claudeResponses *[]*dto.ClaudeResponse, info *relaycom
 	if info.ClaudeConvertInfo.ContentChunks > 0 {
 		return
 	}
+	// Reasoning was already emitted as thinking blocks — don't duplicate as text.
+	if info.ClaudeConvertInfo.ReasoningChunks > 0 {
+		return
+	}
 	reasoningText := info.ClaudeConvertInfo.ReasoningTextBuilder.String()
 	if reasoningText == "" {
 		return
@@ -690,7 +694,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		// 判断首个响应是否存在内容（非标准的 OpenAI 响应）
 		if len(openAIResponse.Choices) > 0 {
 			rawReasoning := openAIResponse.Choices[0].Delta.GetReasoningContent()
-			reasoning := strings.TrimSpace(rawReasoning)
+			reasoning := rawReasoning
 			content := openAIResponse.Choices[0].Delta.GetContentString()
 
 			if reasoning != "" {
@@ -698,17 +702,17 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				info.ClaudeConvertInfo.ReasoningTextBuilder.WriteString(reasoning)
 				if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
 					stopOpenBlocksAndAdvance()
+					idx := info.ClaudeConvertInfo.Index
+					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+						Index: &idx,
+						Type:  "content_block_start",
+						ContentBlock: &dto.ClaudeMediaMessage{
+							Type:     "thinking",
+							Thinking: common.GetPointer[string](""),
+						},
+					})
 				}
-				idx := info.ClaudeConvertInfo.Index
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx,
-					Type:  "content_block_start",
-					ContentBlock: &dto.ClaudeMediaMessage{
-						Type:     "thinking",
-						Thinking: common.GetPointer[string](""),
-					},
-				})
-				idx2 := idx
+				idx2 := info.ClaudeConvertInfo.Index
 				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 					Index: &idx2,
 					Type:  "content_block_delta",
@@ -892,7 +896,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			info.ClaudeConvertInfo.Index = base + maxOffset
 		} else {
 			rawReasoning := chosenChoice.Delta.GetReasoningContent()
-			reasoning := strings.TrimSpace(rawReasoning)
+			reasoning := rawReasoning
 			textContent := chosenChoice.Delta.GetContentString()
 			if reasoning != "" || textContent != "" {
 				// Handle reasoning block (may coexist with text in same chunk)
