@@ -24,6 +24,11 @@ func isMiMoModel(modelID string) bool {
 	return strings.HasPrefix(modelID, "mimo-")
 }
 
+// isMultimodalModel returns true for models that support image input.
+func isMultimodalModel(modelID string) bool {
+	return !isDeepSeekModel(modelID)
+}
+
 // isReasoningContentVendor returns true for vendors that need reasoning_content
 // preserved on assistant messages for multi-turn tool-call round-trips.
 func isReasoningContentVendor(modelID string) bool {
@@ -435,9 +440,12 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 						}
 					}
 				case "image":
+					// Skip images for non-multimodal models (e.g. DeepSeek doesn't support images)
+					if !isMultimodalModel(info.OriginModelName) {
+						continue
+					}
 					// Handle image conversion (base64 to URL or keep as is)
 					imageData := fmt.Sprintf("data:%s;base64,%s", mediaMsg.Source.MediaType, mediaMsg.Source.Data)
-					//textContent += fmt.Sprintf("[Image: %s]", imageData)
 					mediaMessage := dto.MediaContent{
 						Type:     "image_url",
 						ImageUrl: &dto.MessageImageUrl{Url: imageData},

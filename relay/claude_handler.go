@@ -113,6 +113,13 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		info.UpstreamModelName = request.Model
 	}
 
+	// Auto-fallback: switch to mimo-v2.5 when DeepSeek receives image messages
+	if strings.HasPrefix(info.OriginModelName, "deepseek-") && hasImageMessage(request.Messages) {
+		request.Model = "mimo-v2.5"
+		info.OriginModelName = "mimo-v2.5"
+		info.UpstreamModelName = "mimo-v2.5"
+	}
+
 	if info.ChannelSetting.SystemPrompt != "" {
 		if request.System == nil {
 			request.SetStringSystem(info.ChannelSetting.SystemPrompt)
@@ -225,4 +232,24 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 	service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
 	return nil
+}
+
+// hasImageMessage checks whether any message in the conversation contains
+// an image content block. Used by the multimodal auto-fallback logic.
+func hasImageMessage(messages []dto.ClaudeMessage) bool {
+	for _, msg := range messages {
+		if msg.IsStringContent() {
+			continue
+		}
+		blocks, err := msg.ParseContent()
+		if err != nil {
+			continue
+		}
+		for _, block := range blocks {
+			if block.Type == "image" {
+				return true
+			}
+		}
+	}
+	return false
 }
