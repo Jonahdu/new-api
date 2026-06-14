@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
@@ -42,6 +43,10 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	// base_url 已包含 /v1/messages 则直接使用，不重复追加
+	if strings.HasSuffix(info.ChannelBaseUrl, "/v1/messages") {
+		return info.ChannelBaseUrl, nil
+	}
 	requestURL := fmt.Sprintf("%s/v1/messages", info.ChannelBaseUrl)
 	if !shouldAppendClaudeBetaQuery(info) {
 		return requestURL, nil

@@ -39,6 +39,7 @@ type Model struct {
 	EnableGroups  []string       `json:"enable_groups,omitempty" gorm:"-"`
 	QuotaTypes    []int          `json:"quota_types,omitempty" gorm:"-"`
 	NameRule      int            `json:"name_rule" gorm:"default:0"`
+	Multimodal    bool           `json:"multimodal" gorm:"default:false"`
 
 	MatchedModels []string `json:"matched_models,omitempty" gorm:"-"`
 	MatchedCount  int      `json:"matched_count,omitempty" gorm:"-"`
@@ -49,9 +50,10 @@ func (mi *Model) Insert() error {
 	mi.CreatedTime = now
 	mi.UpdatedTime = now
 
-	// 保存原始值（因为 Create 后可能被 GORM 的 default 标签覆盖为 1）
+	// 保存原始值（因为 Create 后可能被 GORM 的 default 标签覆盖）
 	originalStatus := mi.Status
 	originalSyncOfficial := mi.SyncOfficial
+	originalMultimodal := mi.Multimodal
 
 	// 先创建记录（GORM 会对零值字段应用默认值）
 	if err := DB.Create(mi).Error; err != nil {
@@ -62,6 +64,7 @@ func (mi *Model) Insert() error {
 	return DB.Model(&Model{}).Where("id = ?", mi.Id).Updates(map[string]interface{}{
 		"status":        originalStatus,
 		"sync_official": originalSyncOfficial,
+		"multimodal":    originalMultimodal,
 	}).Error
 }
 
@@ -78,7 +81,7 @@ func (mi *Model) Update() error {
 	mi.UpdatedTime = common.GetTimestamp()
 	// 使用 Select 强制更新所有字段，包括零值
 	return DB.Model(&Model{}).Where("id = ?", mi.Id).
-		Select("model_name", "description", "icon", "tags", "vendor_id", "endpoints", "status", "sync_official", "name_rule", "updated_time").
+		Select("model_name", "description", "icon", "tags", "vendor_id", "endpoints", "status", "sync_official", "name_rule", "multimodal", "updated_time").
 		Updates(mi).Error
 }
 
@@ -108,6 +111,18 @@ func GetAllModels(offset int, limit int) ([]*Model, error) {
 	var models []*Model
 	err := DB.Order("id DESC").Offset(offset).Limit(limit).Find(&models).Error
 	return models, err
+}
+
+// GetModelMultimodal returns whether a model supports image input.
+// If the model has no model_meta entry, found=false and the caller should
+// fall back to apiType-based heuristics.
+func GetModelMultimodal(modelName string) (multimodal bool, found bool) {
+	var m Model
+	err := DB.Where("model_name = ?", modelName).First(&m).Error
+	if err != nil {
+		return false, false
+	}
+	return m.Multimodal, true
 }
 
 func GetBoundChannelsByModelsMap(modelNames []string) (map[string][]BoundChannel, error) {

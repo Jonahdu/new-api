@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/reasonmap"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/samber/lo"
 )
 
@@ -24,9 +25,13 @@ func isMiMoModel(modelID string) bool {
 	return strings.HasPrefix(modelID, "mimo-")
 }
 
-// isMultimodalModel returns true for models that support image input.
-func isMultimodalModel(modelID string) bool {
-	return !isDeepSeekModel(modelID)
+// IsMultimodalModel checks whether a model supports image input.
+// Queries model_meta table. Only models explicitly marked multimodal=true
+// can receive image input; everything else (unlisted or multimodal=false)
+// gets images stripped.
+func IsMultimodalModel(apiType int, modelName string) bool {
+	multimodal, found := model.GetModelMultimodal(modelName)
+	return found && multimodal
 }
 
 // isReasoningContentVendor returns true for vendors that need reasoning_content
@@ -441,7 +446,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 					}
 				case "image":
 					// Skip images for non-multimodal models (e.g. DeepSeek doesn't support images)
-					if !isMultimodalModel(info.OriginModelName) {
+					if !IsMultimodalModel(info.ApiType, info.OriginModelName) {
 						continue
 					}
 					// Handle image conversion (base64 to URL or keep as is)

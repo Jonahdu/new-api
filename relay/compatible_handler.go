@@ -44,6 +44,12 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
 
+	// Strip images for non-multimodal models (e.g. DeepSeek doesn't support images)
+	if !service.IsMultimodalModel(info.ApiType, info.OriginModelName) && hasImageInOpenAIRequest(request) {
+		stripImagesFromOpenAIRequest(request)
+		logger.LogDebug(c, "模型 %s 不支持图片输入，已忽略图片内容", info.OriginModelName)
+	}
+
 	includeUsage := true
 	// 判断用户是否需要返回使用情况
 	if request.StreamOptions != nil {
@@ -220,4 +226,38 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
 	}
 	return nil
+}
+
+
+// hasImageInOpenAIRequest checks whether an OpenAI-format request contains image content.
+func hasImageInOpenAIRequest(req *dto.GeneralOpenAIRequest) bool {
+	for _, msg := range req.Messages {
+		if msg.Content == nil {
+			continue
+		}
+		contents := msg.ParseContent()
+		for _, content := range contents {
+			if content.Type == dto.ContentTypeImageURL {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stripImagesFromOpenAIRequest removes all image_url content blocks from messages.
+func stripImagesFromOpenAIRequest(req *dto.GeneralOpenAIRequest) {
+	for i, msg := range req.Messages {
+		if msg.IsStringContent() {
+			continue
+		}
+		contents := msg.ParseContent()
+		filtered := make([]dto.MediaContent, 0, len(contents))
+		for _, c := range contents {
+			if c.Type != dto.ContentTypeImageURL {
+				filtered = append(filtered, c)
+			}
+		}
+		req.Messages[i].SetMediaContent(filtered)
+	}
 }

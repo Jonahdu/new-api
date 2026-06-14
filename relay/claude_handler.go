@@ -113,11 +113,10 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		info.UpstreamModelName = request.Model
 	}
 
-	// Auto-fallback: switch to mimo-v2.5 when DeepSeek receives image messages
-	if strings.HasPrefix(info.OriginModelName, "deepseek-") && hasImageMessage(request.Messages) {
-		request.Model = "mimo-v2.5"
-		info.OriginModelName = "mimo-v2.5"
-		info.UpstreamModelName = "mimo-v2.5"
+	// Strip images for non-multimodal models (e.g. DeepSeek doesn't support images)
+	if !service.IsMultimodalModel(info.ApiType, info.OriginModelName) && hasImageMessage(request.Messages) {
+		stripImagesFromClaudeRequest(request)
+		logger.LogDebug(c, "模型 %s 不支持图片输入，已忽略图片内容", info.OriginModelName)
 	}
 
 	if info.ChannelSetting.SystemPrompt != "" {
@@ -253,4 +252,24 @@ func hasImageMessage(messages []dto.ClaudeMessage) bool {
 		}
 	}
 	return false
+}
+
+// stripImagesFromClaudeRequest removes all image content blocks from Claude messages.
+func stripImagesFromClaudeRequest(request *dto.ClaudeRequest) {
+	for i, msg := range request.Messages {
+		if msg.IsStringContent() {
+			continue
+		}
+		blocks, _ := msg.ParseContent()
+		if blocks == nil {
+			continue
+		}
+		filtered := make([]dto.ClaudeMediaMessage, 0, len(blocks))
+		for _, block := range blocks {
+			if block.Type != "image" {
+				filtered = append(filtered, block)
+			}
+		}
+		request.Messages[i].Content = filtered
+	}
 }
